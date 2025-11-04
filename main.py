@@ -1,11 +1,10 @@
 import os
-import math
 import re
-from statistics import median
-from typing import List, Dict, Any, Tuple
 import cv2
 import numpy as np
 import pytesseract
+import regex
+from PIL import Image
 
 try:
     import easyocr
@@ -14,203 +13,231 @@ try:
 except Exception:
     EASY_AVAILABLE = False
 
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-LANGS = "uzb+uzb_cyrl+rus+eng"
-SCALE = 1.6
-LINE_Y_TOL = 18
-USE_TESSERACT_FALLBACK = True
-PRESERVE_LEADING_INDENT = True
-TAB_WIDTH = 4
+try:
+    import ftfy
 
+    FTFY_AVAILABLE = True
+except Exception:
+    FTFY_AVAILABLE = False
+
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-_ALPHA_RE = re.compile(r"[A-Za-zА-Яа-яЁёЎўҚқҒғҲҳЇїІіҢң]", re.UNICODE)
+LANGS = "uzb+uzb_cyrl+rus+eng"
+SCALE = 1.75
+PARA_GAP_MULT = 1.8
+PSM_BLOCK = 6
+PSM_LINE = 7
+USE_EASYOCR_DETECT_FALLBACK = True
+USE_TESSERACT_FOR_FINAL_TEXT = True
+
 _CYR_RE = re.compile(r"[А-Яа-яЁёЎўҚқҒғҲҳЇїІіҢң]", re.UNICODE)
 _LAT_RE = re.compile(r"[A-Za-z]", re.UNICODE)
+_EMOJI_RE = regex.compile(r"\p{Emoji}", flags=regex.UNICODE)
+
+_DASH_PATTERN = re.compile(r"\s*(?:--|—|–|-\s*-|_{2,})\s*")
+_ELLIPSIS = re.compile(r"(?<!\.)\.{3}(?!\.)")
+_GARBAGE_SINGLETONS = set(list("®©™•·¤§^`~|\\/<>$@#&*_="))
 
 
-def read_image(path: str) -> np.ndarray:
-    img = cv2.imread(path)
+def read_image(path: str):
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(path)
     if SCALE != 1.0:
         img = cv2.resize(img, (int(img.shape[1] * SCALE), int(img.shape[0] * SCALE)), interpolation=cv2.INTER_LINEAR)
+    if img.ndim == 3 and img.shape[2] == 4:
+        b, g, r, a = cv2.split(img)
+        a = a.astype(np.float32) / 255.0
+        bg = np.full_like(a, 255.0)
+        b = (b * a + bg * (1 - a)).astype(np.uint8)
+        g = (g * a + bg * (1 - a)).astype(np.uint8)
+        r = (r * a + bg * (1 - a)).astype(np.uint8)
+        img = cv2.merge([b, g, r])
     return img
 
 
-def detect_boxes_easy(image: np.ndarray) -> List[Dict[str, Any]]:
-    h, w = image.shape[:2]
-
-    if EASY_AVAILABLE:
-        try:
-            reader = easyocr.Reader(["ru", "en"], gpu=False)
-            raw = reader.readtext(image, detail=1)
-        except Exception as e:
-            print(f"EasyOCR failed ({e}), using Tesseract fallback detection.")
-            raw = []
-
-        boxes = []
-        for item in raw:
-            box_pts, text, conf = item[0], item[1], float(item[2] or 0.0)
-            xs = [int(round(p[0])) for p in box_pts]
-            ys = [int(round(p[1])) for p in box_pts]
-            boxes.append({
-                "left": max(0, min(xs)),
-                "top": max(0, min(ys)),
-                "right": min(w, max(xs)),
-                "bottom": min(h, max(ys)),
-                "text": text.strip(),
-                "conf": conf
-            })
-        if boxes:
-            return boxes
-
-    data = pytesseract.image_to_data(image, lang=LANGS, config="--oem 3 --psm 3", output_type=pytesseract.Output.DICT)
-    boxes = []
-    for i in range(len(data["text"])):
-        txt = str(data["text"][i]).strip()
-        if not txt:
-            continue
-        left, top = int(data["left"][i]), int(data["top"][i])
-        width, height = int(data["width"][i]), int(data["height"][i])
-        if width > 0 and height > 0:
-            boxes.append({
-                "left": left, "top": top,
-                "right": left + width, "bottom": top + height,
-                "text": txt, "conf": float(data["conf"][i]) if data["conf"][i].isdigit() else 0.0
-            })
-    return boxes
+def to_gray(img):
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
 
-def ocr_box_tesseract(img_gray: np.ndarray, box: Dict[str, Any], psm: int = 7) -> Tuple[str, float]:
-    x1, y1, x2, y2 = box["left"], box["top"], box["right"], box["bottom"]
-    h, w = img_gray.shape[:2]
-    pad = max(2, int((y2 - y1) * 0.08))
-    x1, y1, x2, y2 = max(0, x1 - pad), max(0, y1 - pad), min(w, x2 + pad), min(h, y2 + pad)
-    crop = img_gray[y1:y2, x1:x2]
-
-    guess_text = box.get("text", "")
-    if _CYR_RE.search(guess_text):
-        lang = "uzb_cyrl+rus+eng"
-    elif _LAT_RE.search(guess_text):
-        lang = "uzb+eng"
-    else:
-        lang = LANGS
-
-    config = f"--oem 3 --psm {psm}"
-    try:
-        text = pytesseract.image_to_string(crop, lang=lang, config=config).strip()
-    except Exception:
-        text = ""
-
-    conf = 0.0
-    try:
-        d = pytesseract.image_to_data(crop, lang=lang, config=config, output_type=pytesseract.Output.DICT)
-        valid = [float(c) for c in d["conf"] if c.replace(".", "", 1).isdigit() and float(c) >= 0]
-        if valid:
-            conf = sum(valid) / len(valid)
-    except Exception:
-        pass
-
-    return text, conf
+def auto_invert_for_dark_theme(gray):
+    return 255 - gray if gray.mean() < 120 else gray
 
 
-def group_into_lines(boxes: List[Dict[str, Any]], y_tol: int = LINE_Y_TOL) -> List[List[Dict[str, Any]]]:
-    if not boxes:
-        return []
-    boxes_sorted = sorted(boxes, key=lambda b: (b["top"] + b["bottom"]) // 2)
-    lines, current = [], [boxes_sorted[0]]
-    for b in boxes_sorted[1:]:
-        cy = (b["top"] + b["bottom"]) // 2
-        mean_cy = sum((r["top"] + r["bottom"]) // 2 for r in current) / len(current)
-        if abs(cy - mean_cy) <= y_tol:
-            current.append(b)
+def preprocess_for_ocr(img):
+    gray = to_gray(img)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.bilateralFilter(gray, d=5, sigmaColor=40, sigmaSpace=40)
+    gray = auto_invert_for_dark_theme(gray)
+    return gray
+
+
+def detect_words_and_lines_tesseract(gray):
+    d = pytesseract.image_to_data(gray, lang=LANGS, config=f"--oem 3 --psm {PSM_BLOCK} -c preserve_interword_spaces=1",
+                                  output_type=pytesseract.Output.DICT)
+    n = len(d["text"])
+    if n == 0: return []
+
+    lines_map = {}
+    for i in range(n):
+        txt = (d["text"][i] or "").strip()
+        level = int(d.get("level", [0])[i])
+        if level != 5: continue
+        block, par, line_no, word_no = int(d["block_num"][i]), int(d["par_num"][i]), int(d["line_num"][i]), int(
+            d["word_num"][i])
+        left, top, w, h = int(d["left"][i]), int(d["top"][i]), int(d["width"][i]), int(d["height"][i])
+        conf_raw = str(d["conf"][i])
+        conf = float(conf_raw) if conf_raw.replace(".", "", 1).lstrip("-").isdigit() else -1.0
+        key = (block, par, line_no)
+        word = {"left": left, "top": top, "right": left + w, "bottom": top + h, "text": txt, "conf": conf,
+                "word_num": word_no}
+        if key not in lines_map:
+            lines_map[key] = {"left": left, "top": top, "right": left + w, "bottom": top + h, "words": [word],
+                              "conf_vals": [conf if conf >= 0 else 0.0]}
         else:
-            lines.append(sorted(current, key=lambda x: x["left"]))
-            current = [b]
-    if current:
-        lines.append(sorted(current, key=lambda x: x["left"]))
+            L = lines_map[key]
+            L["left"] = min(L["left"], left)
+            L["top"] = min(L["top"], top)
+            L["right"] = max(L["right"], left + w)
+            L["bottom"] = max(L["bottom"], top + h)
+            L["words"].append(word)
+            if conf >= 0:
+                L["conf_vals"].append(conf)
+
+    lines = []
+    for key, item in sorted(lines_map.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2])):
+        words_sorted = sorted(item["words"], key=lambda w: (w["left"], w["word_num"]))
+        avg_conf = sum(item["conf_vals"]) / max(1, len(item["conf_vals"]))
+        guess = " ".join([w["text"].strip() for w in words_sorted if w["text"].strip()])
+        lines.append({"left": item["left"], "top": item["top"], "right": item["right"], "bottom": item["bottom"],
+                      "words": words_sorted, "conf": avg_conf, "text": guess})
     return lines
 
 
-def build_line_grid(line_boxes: List[Dict[str, Any]], texts: List[str]) -> str:
-    char_widths = []
-    for b, t in zip(line_boxes, texts):
-        w = b["right"] - b["left"]
-        if len(t.strip()) > 0:
-            char_widths.append(w / max(1, len(t.strip())))
-    avg_char_w = median(char_widths) if char_widths else 8.0
-
-    max_x = max((b["right"] for b in line_boxes), default=0)
-    cols = int(math.ceil(max_x / avg_char_w)) + 4
-    grid = [" "] * cols
-
-    for b, t in zip(line_boxes, texts):
-        col = int(round(b["left"] / avg_char_w))
-        for i, ch in enumerate(t):
-            pos = col + i
-            if pos >= len(grid):
-                grid.extend([" "] * (pos - len(grid) + 1))
-            grid[pos] = ch
-    return "".join(grid).rstrip()
-
-
-def postprocess_join_letters(line: str) -> str:
-    tokens = line.split(" ")
-    i, out = 0, []
-    while i < len(tokens):
-        if len(tokens[i]) == 1 and _ALPHA_RE.search(tokens[i]):
-            run = []
-            while i < len(tokens) and len(tokens[i]) == 1 and _ALPHA_RE.search(tokens[i]):
-                run.append(tokens[i])
-                i += 1
-            if len(run) >= 3:
-                out.append("".join(run))
+def smart_quotes_and_dashes(s: str) -> str:
+    out = []
+    open_dbl = True
+    open_sgl = True
+    for i, ch in enumerate(s):
+        if ch == '"':
+            out.append("“" if open_dbl else "”");
+            open_dbl = not open_dbl
+        elif ch == "'":
+            prev = s[i - 1] if i > 0 else " "
+            nxt = s[i + 1] if i + 1 < len(s) else " "
+            if prev.isalnum() and nxt.isalnum():
+                out.append("’")
             else:
-                out.extend(run)
+                out.append("‘" if open_sgl else "’");
+                open_sgl = not open_sgl
         else:
-            out.append(tokens[i])
-            i += 1
-    return " ".join([t for t in out if t is not None])
+            out.append(ch)
+    s = "".join(out)
+    s = _DASH_PATTERN.sub(" — ", s)
+    s = re.sub(r"\s*—\s*", " — ", s)
+    s = _ELLIPSIS.sub("…", s)
+    return s
+
+
+def ensure_spaces_around_emojis(s: str) -> str:
+    s = regex.sub(r"(?<!\s)(\p{Emoji})", r" \1", s)
+    s = regex.sub(r"(\p{Emoji})(?![\s,.;:?!\)\]\}])", r"\1 ", s)
+    s = re.sub(r"[ \t]{3,}", "  ", s)
+    return s
+
+
+def tidy_punctuation_spacing(s: str) -> str:
+    s = re.sub(r"\s+([,.;:?!%])", r"\1", s)
+    s = re.sub(r"\s+([”’»\)\]\}])", r"\1", s)
+    s = re.sub(r"([\(«„“\[\{])\s+", r"\1", s)
+    s = re.sub(r"([,.;:?!”’\)\]\}—])([^\s.,;:?!])", r"\1 \2", s)
+    s = re.sub(r"[ \t]{3,}", "  ", s)
+    return s
+
+
+def postprocess_line(s: str) -> str:
+    if FTFY_AVAILABLE: s = ftfy.fix_text(s)
+    s = smart_quotes_and_dashes(s)
+    s = tidy_punctuation_spacing(s)
+    s = ensure_spaces_around_emojis(s)
+    return s.rstrip()
+
+
+def estimate_space_width(lines):
+    widths = []
+    for b in lines:
+        txt = (b.get("final_text") or "").strip("\n")
+        if not txt: continue
+        line_width_px = max(1, b["right"] - b["left"])
+        avg_char = line_width_px / max(1, len(txt))
+        widths.append(avg_char)
+    return np.median(widths) * 0.55 if widths else 8.0
+
+
+def prepend_indentation(lines):
+    if not lines: return []
+    min_left = min(b["left"] for b in lines)
+    space_px = estimate_space_width(lines)
+    out = []
+    for b in lines:
+        txt = b.get("final_text", "")
+        if not txt: out.append(""); continue
+        delta = max(0, b["left"] - min_left)
+        n_spaces = int(round(delta / max(1.0, space_px)))
+        out.append((" " * n_spaces) + txt)
+    return out
 
 
 def process_image_file(path: str, out_dir: str):
     print(f"Processing: {os.path.basename(path)}")
     img = read_image(path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = preprocess_for_ocr(img)
 
-    boxes = detect_boxes_easy(img)
-    if not boxes:
-        text = pytesseract.image_to_string(gray, lang=LANGS, config="--oem 3 --psm 3")
+    lines = detect_words_and_lines_tesseract(gray)
+    if not lines and USE_EASYOCR_DETECT_FALLBACK:
+        try:
+            reader = easyocr.Reader(["ru", "en"], gpu=False)
+            raw = reader.readtext(img, detail=1)
+            lines = []
+            for item in raw:
+                pts, text, conf = item[0], item[1], float(item[2] or 0.0)
+                xs = [int(round(p[0])) for p in pts];
+                ys = [int(round(p[1])) for p in pts]
+                lines.append(
+                    {"left": min(xs), "top": min(ys), "right": max(xs), "bottom": max(ys), "text": text.strip(),
+                     "conf": conf, "words": []})
+        except Exception:
+            pass
+
+    if not lines:
+        text = pytesseract.image_to_string(gray, lang=LANGS, config=f"--oem 3 --psm {PSM_BLOCK}")
+        text_lines = [postprocess_line(t) for t in text.splitlines()]
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, os.path.splitext(os.path.basename(path))[0] + ".txt")
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(text.strip())
-        print("Fallback (full Tesseract):", out_path)
+        with open(out_path, "w", encoding="utf-8") as f: f.write("\n".join(text_lines).strip())
+        print("Fallback:", out_path)
         return
 
-    if USE_TESSERACT_FALLBACK:
-        for b in boxes:
-            t_text, t_conf = ocr_box_tesseract(gray, b)
-            if t_text:
-                if t_conf >= 30 or len(t_text) > len(b.get("text", "")):
-                    b["text"] = t_text
+    lines = sorted(lines, key=lambda b: ((b["top"] + b["bottom"]) // 2, b["left"]))
+    median_height = np.median([b["bottom"] - b["top"] for b in lines]) if lines else 16
+    paragraph_markers = []
 
-    lines = group_into_lines(boxes, y_tol=LINE_Y_TOL)
+    for idx, b in enumerate(lines):
+        base_text = b.get("text", "")
+        final_text = postprocess_line(base_text)
+        b["final_text"] = final_text
+        center = (b["top"] + b["bottom"]) / 2.0
+        if idx > 0 and center - prev_center > median_height * PARA_GAP_MULT:
+            paragraph_markers.append(idx)
+        prev_center = center if 'prev_center' in locals() else center
 
+    indented_lines = prepend_indentation(lines)
     out_lines = []
-    prev_center = None
-    median_height = np.median([b["bottom"] - b["top"] for b in boxes]) if boxes else 15
-
-    for line_boxes in lines:
-        texts = [b["text"] for b in line_boxes]
-        line_str = build_line_grid(line_boxes, texts)
-        line_str = postprocess_join_letters(line_str)
-        center = sum((b["top"] + b["bottom"]) // 2 for b in line_boxes) / len(line_boxes)
-        if prev_center and center - prev_center > median_height * 1.8:
-            out_lines.append("")
-        out_lines.append(line_str)
-        prev_center = center
+    for i, line_text in enumerate(indented_lines):
+        if i in paragraph_markers: out_lines.append("")
+        out_lines.append(line_text)
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, os.path.splitext(os.path.basename(path))[0] + ".txt")
@@ -219,13 +246,13 @@ def process_image_file(path: str, out_dir: str):
     print("Wrote:", out_path)
 
 
-def process_folder(input_folder: str = "images", output_folder: str = "results"):
+def process_folder(input_folder="images", output_folder="results"):
+    os.makedirs(output_folder, exist_ok=True)
     files = [f for f in os.listdir(input_folder) if
              f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"))]
     if not files:
         print("No images found in", input_folder)
         return
-
     for fn in sorted(files):
         path = os.path.join(input_folder, fn)
         try:
